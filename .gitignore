@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+config.json
+*.json
+!SKILL.md
+!manage_models.py
+!README.md
