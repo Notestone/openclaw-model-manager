@@ -6,6 +6,19 @@ Why pay **$15/1M tokens** for simple translations or summaries when you can pay 
 
 Interact with OpenRouter API to fetch available models, compare pricing instantly, and configure OpenClaw to use the most cost-effective models via the `openrouter/auto` gateway.
 
+---
+
+### 🇨🇳 中文说明
+
+**💰 拒绝冤枉钱！自动路由高性价比模型，最高节省 96% Token 费用。**
+
+为什么要花 **$15/1M tokens** 的价格去处理简单的翻译或摘要任务？明明可以用 **$0.60/1M** 的模型搞定！
+
+这个 Skill 能帮你：
+1.  **即时比价**：列出当前 OpenRouter 上的模型价格（每百万 Token 输入/输出成本），一目了然。
+2.  **智能配置**：自动将简单任务路由给高性价比的小模型（如 GPT-4o-mini, Haiku），复杂任务留给大模型。
+3.  **保持最新**：随时获取 OpenRouter 上最新的降价信息和新模型。
+
 ### 📉 Cost Savings Logic (Per 1M Output Tokens)
 
 | Model | Best For | Price | Savings Potential |
@@ -25,7 +38,7 @@ Interact with OpenRouter API to fetch available models, compare pricing instantl
 1. Clone this repository into your OpenClaw skills directory:
    ```bash
    cd ~/.openclaw/workspace/skills
-   git clone https://github.com/YourUsername/openclaw-model-manager.git model-manager
+   git clone https://github.com/Notestone/openclaw-model-manager.git model-manager
    ```
 
 2. That's it! OpenClaw will detect the `SKILL.md`.
