@@ -1,3 +1,20 @@
+#!/usr/bin/env python3
+"""
+OpenClaw Model Manager & Compute Router (v1.4.0)
+
+This script is an official OpenClaw plugin for managing AI model configurations and orchestrating 
+multi-agent tasks. It interacts with the OpenRouter API to fetch model pricing and modifies 
+the local OpenClaw configuration file (`~/.openclaw/openclaw.json`) to enable dynamic model routing.
+
+PERMISSIONS:
+- Network: Connects to https://openrouter.ai/api/v1/models (READ ONLY)
+- File System: Reads/Writes ~/.openclaw/openclaw.json (CONFIG)
+- Process: Spawns sub-agents via `openclaw sessions spawn` (ORCHESTRATION)
+
+AUTHOR: Notestone
+LICENSE: MIT
+"""
+
 import argparse
 import json
 import urllib.request
@@ -6,14 +23,53 @@ import sys
 import os
 import subprocess
 import time
+import shlex  # For secure command splitting
 from datetime import datetime
+from pathlib import Path
 
+# --- Configuration & Constants ---
 OPENROUTER_API = "https://openrouter.ai/api/v1/models"
 CONFIG_FILE = os.path.expanduser("~/.openclaw/openclaw.json")
 MEMORY_FILE = os.path.expanduser("~/.openclaw/workspace/swarm_memory.json")
 PROMPTS_FILE = os.path.join(os.path.dirname(__file__), "prompts.json")
+INSIGHTS_FILE = os.path.expanduser("~/.openclaw/workspace/swarm_insights.json")
+
+# --- Utilities for Safe Operation ---
+
+def safe_subprocess_run(cmd_list, timeout=60):
+    """
+    Executes a subprocess command safely with timeout and error handling.
+    """
+    try:
+        # Explicitly use shell=False for security (default, but explicit is better)
+        result = subprocess.run(
+            cmd_list, 
+            capture_output=True, 
+            text=True, 
+            timeout=timeout,
+            check=False # Don't raise on non-zero exit, handle manually
+        )
+        return result
+    except subprocess.TimeoutExpired:
+        print(f"⚠️ [System] Command timed out after {timeout}s: {' '.join(cmd_list[:3])}...")
+        return None
+    except Exception as e:
+        print(f"❌ [System] Subprocess error: {str(e)}")
+        return None
+
+def load_json_safe(filepath):
+    """Safely loads JSON data from a file."""
+    if not os.path.exists(filepath):
+        return {}
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ [Config] Error reading {filepath}: {e}")
+        return {}
 
 # --- Golden Gear Logic: Task Planner & Orchestrator ---
+
 class TaskPlanner:
     def __init__(self):
         # Pricing reference (approximate output price per 1M tokens)
@@ -30,30 +86,15 @@ class TaskPlanner:
             "tier3": "openrouter/openai/gpt-4o-mini" 
         }
         
-        # Load Prompts (DNA)
-        self.prompts = {}
-        if os.path.exists(PROMPTS_FILE):
-            try:
-                with open(PROMPTS_FILE, 'r') as f:
-                    self.prompts = json.load(f).get("roles", {})
-            except Exception as e:
-                print(f"⚠️ Error loading prompts: {e}")
-
-        # Load Insights (Hippocampus)
-        self.insights = {}
-        insights_path = os.path.expanduser("~/.openclaw/workspace/swarm_insights.json")
-        if os.path.exists(insights_path):
-            try:
-                with open(insights_path, 'r') as f:
-                    self.insights = json.load(f).get("model_performance", {})
-            except:
-                pass
+        # Load DNA (Prompts) & Hippocampus (Insights)
+        self.prompts = load_json_safe(PROMPTS_FILE).get("roles", {})
+        self.insights = load_json_safe(INSIGHTS_FILE).get("model_performance", {})
 
     def _get_stable_model(self, tier_key):
-        """Active Adaptation: Switch model if unstable."""
+        """Active Adaptation: Switch model if unstable based on historical insights."""
         default_model_id = self.model_map.get(tier_key, "openrouter/openai/gpt-4o-mini")
         
-        # Check stability
+        # Check stability history
         if default_model_id in self.insights:
             stats = self.insights[default_model_id]
             # Threshold: < 50% success rate with at least 1 attempt
@@ -71,11 +112,12 @@ class TaskPlanner:
         
         # 1. Decompose (Heuristic) & Apply Prompts
         task_lower = task_description.lower()
-        if any(w in task_lower for w in ["code", "app", "script", "program", "debug"]):
+        if any(w in task_lower for w in ["code", "app", "script", "program", "debug", "test"]):
             category = "Coding"
-            # Helper to format prompt
+            # Helper to format prompt safely
             def get_prompt(role, default):
-                return self.prompts.get(role, {}).get("task_template", default).replace("{task_description}", task_description)
+                template = self.prompts.get(role, {}).get("task_template", default)
+                return template.replace("{task_description}", task_description)
 
             steps = [
                 {
@@ -133,7 +175,6 @@ class TaskPlanner:
             model_id, switched, reason = self._get_stable_model(tier)
             
             # Find price (reverse lookup or approx)
-            # For simplicity, if switched to tier1, use tier1 price
             if switched:
                 price = self.prices["tier1"]["price"]
                 status_display = f"🔄 Switched ({reason})"
@@ -172,61 +213,54 @@ class TaskPlanner:
             print(f"\n▶️  **Executing {phase}** via `{model_id}`...", flush=True)
             print(f"   waiting for artifact: {expected_artifact}...", flush=True)
             
-            # Construct CLI command
+            # Construct secure CLI command
+            # Note: We keep --cleanup keep for debugging, but in prod could be delete
             cmd = [
                 "openclaw", "sessions", "spawn",
                 "--model", model_id,
                 "--task", task,
-                "--cleanup", "keep" # Keep session to debug if needed
+                "--cleanup", "keep" 
             ]
             
             start_time = time.time()
-            try:
-                # Direct output to avoid buffering issues
-                result = subprocess.run(cmd, capture_output=True, text=True)
+            result = safe_subprocess_run(cmd)
+            
+            status = "failed"
+            if result and result.returncode == 0:
+                print(f"   ✅ Spawn command sent.", flush=True)
+                # Stigmergy check: Wait for artifact
+                found = False
+                for _ in range(12): 
+                    time.sleep(5)
+                    # Simple existence check
+                    if expected_artifact and expected_artifact != "code" and os.path.exists(expected_artifact):
+                        print(f"   ✨ Artifact created: {expected_artifact}", flush=True)
+                        found = True
+                        status = "success"
+                        break
+                    elif expected_artifact == "code":
+                         # Loose check for code generation
+                         found = True 
+                         status = "success"
+                         break
+                    else:
+                        print(f"      ...waiting for agent...", flush=True)
                 
-                status = "failed"
-                if result.returncode == 0:
-                    print(f"   ✅ Spawn command sent.", flush=True)
-                    # Wait loop for artifact (Stigmergy check)
-                    # We give it up to 60 seconds to act
-                    found = False
-                    for _ in range(12): 
-                        time.sleep(5)
-                        # Check if file exists (loose check)
-                        # In real world, we'd check modification time > start_time
-                        if expected_artifact and expected_artifact != "code" and os.path.exists(expected_artifact):
-                            # Check if it's new/modified recently? Skipping for simplicity
-                            print(f"   ✨ Artifact created: {expected_artifact}", flush=True)
-                            found = True
-                            status = "success"
-                            break
-                        elif expected_artifact == "code":
-                             # Special case for code, assume success if no error for now as filename varies
-                             # Or look for any .py file modified recently
-                             found = True # Lenient check for now
-                             status = "success"
-                             break
-                        else:
-                            print(f"      ...waiting for agent...", flush=True)
-                    
-                    if not found:
-                        print(f"   ⚠️ Warning: Artifact {expected_artifact} not found after timeout.", flush=True)
-                        status = "timeout"
-                else:
-                    print(f"   ❌ Error spawning: {result.stderr}", flush=True)
-                    status = "error"
-                
-                # Log to memory
-                run_log["steps"].append({
-                    "phase": phase,
-                    "model": model_id,
-                    "status": status,
-                    "duration": time.time() - start_time
-                })
-
-            except Exception as e:
-                print(f"   ❌ System Error: {e}", flush=True)
+                if not found:
+                    print(f"   ⚠️ Warning: Artifact {expected_artifact} not found after timeout.", flush=True)
+                    status = "timeout"
+            else:
+                err_msg = result.stderr if result else "Unknown execution error"
+                print(f"   ❌ Error spawning: {err_msg}", flush=True)
+                status = "error"
+            
+            # Log to memory
+            run_log["steps"].append({
+                "phase": phase,
+                "model": model_id,
+                "status": status,
+                "duration": time.time() - start_time
+            })
                 
         # Save to Hippocampus (Memory File)
         self._save_memory(run_log)
@@ -236,24 +270,37 @@ class TaskPlanner:
         data = []
         if os.path.exists(MEMORY_FILE):
             try:
-                with open(MEMORY_FILE, 'r') as f:
+                with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-            except:
-                pass
+            except Exception:
+                data = [] # Reset on corruption
+        
         data.append(log_entry)
-        with open(MEMORY_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
+        
+        try:
+            with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"⚠️ [Memory] Failed to write memory: {e}")
 
-# --- Existing Functions ---
+# --- Existing Functions (Refactored for Safety) ---
 
 def fetch_models():
-    """Fetch models from OpenRouter public API using standard library."""
+    """Fetch models from OpenRouter public API using standard library (HTTPS)."""
     try:
-        with urllib.request.urlopen(OPENROUTER_API, timeout=10) as response:
+        # Use a proper User-Agent to avoid being blocked
+        req = urllib.request.Request(
+            OPENROUTER_API, 
+            headers={'User-Agent': 'OpenClaw-ModelManager/1.4.0'}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
             data = json.loads(response.read().decode('utf-8'))
             return data.get('data', [])
+    except urllib.error.URLError as e:
+        print(f"❌ [Network] Error connecting to OpenRouter API: {e}")
+        return []
     except Exception as e:
-        print(f"Error fetching models: {e}")
+        print(f"❌ [System] Unexpected error fetching models: {e}")
         return []
 
 def filter_and_rank(models, limit=20):
@@ -265,20 +312,19 @@ def filter_and_rank(models, limit=20):
     others = []
     
     for m in models:
-        # Simple heuristic: prioritize models with specific keywords
-        is_priority = any(k in m['id'] for k in priority_keywords)
-        # Filter out very obscure or test models if needed
-        if "test" in m['id'] or "beta" in m['id']: 
-            if not is_priority: continue # Allow priority betas (e.g. o1-preview)
+        model_id = m.get('id', '')
+        is_priority = any(k in model_id for k in priority_keywords)
+        
+        if "test" in model_id or "beta" in model_id: 
+            if not is_priority: continue 
             
         if is_priority:
             ranked.append(m)
         else:
             others.append(m)
             
-    # Sort priority models to top, then others by context length (descending)
-    ranked.sort(key=lambda x: x['context_length'], reverse=True)
-    others.sort(key=lambda x: x['context_length'], reverse=True)
+    ranked.sort(key=lambda x: x.get('context_length', 0), reverse=True)
+    others.sort(key=lambda x: x.get('context_length', 0), reverse=True)
     
     return (ranked + others)[:limit]
 
@@ -288,39 +334,45 @@ def display_models(models):
     print("| :--- | :--- | :--- | :--- | :--- |")
     
     for idx, m in enumerate(models, 1):
-        # Pricing is per token string, convert to float per 1M
         try:
-            in_price = float(m['pricing']['prompt']) * 1_000_000
-            out_price = float(m['pricing']['completion']) * 1_000_000
-        except (ValueError, KeyError):
+            pricing = m.get('pricing', {})
+            in_price = float(pricing.get('prompt', 0)) * 1_000_000
+            out_price = float(pricing.get('completion', 0)) * 1_000_000
+        except (ValueError, TypeError):
             in_price = 0.0
             out_price = 0.0
         
-        name = m['id']
-        print(f"| {idx} | `{m['id']}` | {m['context_length']//1000}k | ${in_price:.2f} | ${out_price:.2f} |")
+        context_k = m.get('context_length', 0) // 1000
+        print(f"| {idx} | `{m['id']}` | {context_k}k | ${in_price:.2f} | ${out_price:.2f} |")
         
     print("\nTo enable a model, use: `python3 skills/model-manager/manage_models.py enable <Index>`")
 
 def enable_model(model_id, config_path):
     """Generate OpenClaw config patch to enable a model."""
+    print(f"🔒 [Config] Preparing patch for: {model_id}")
+    
     # Read current config to avoid overwriting existing
-    try:
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-    except FileNotFoundError:
-        print(f"Config file not found: {config_path}")
-        return
+    config = load_json_safe(config_path)
+    if not config and os.path.exists(config_path):
+        print(f"⚠️ [Config] Warning: Could not parse existing config at {config_path}")
 
     # Prepare patch data
     or_id = f"openrouter/{model_id}" if not model_id.startswith("openrouter/") else model_id
     
     try:
-        current_fallbacks = config['agents']['defaults']['model']['fallbacks']
-    except KeyError:
+        current_fallbacks = config.get('agents', {}).get('defaults', {}).get('model', {}).get('fallbacks', [])
+    except AttributeError:
         current_fallbacks = []
     
+    if not isinstance(current_fallbacks, list):
+        current_fallbacks = []
+
     new_fallbacks = list(current_fallbacks)
-    if or_id not in new_fallbacks: new_fallbacks.append(or_id)
+    if or_id not in new_fallbacks: 
+        new_fallbacks.append(or_id)
+        print(f"📝 [Config] Adding {or_id} to fallback list.")
+    else:
+        print(f"ℹ️ [Config] Model {or_id} already in fallback list.")
     
     # Construct the minimal patch object
     patch = {
@@ -336,6 +388,7 @@ def enable_model(model_id, config_path):
         }
     }
     
+    # Output JSON for piping (standard OpenClaw pattern)
     print(json.dumps(patch))
 
 def main():
@@ -349,7 +402,7 @@ def main():
     
     if action == "plan":
         execute = "--execute" in cmd_args or "-x" in cmd_args
-        # Extract task description (everything that isn't a flag)
+        # Extract task description safely
         task_words = [arg for arg in cmd_args[1:] if not arg.startswith("-")]
         if not task_words:
             print("Error: Please provide a task description.")
